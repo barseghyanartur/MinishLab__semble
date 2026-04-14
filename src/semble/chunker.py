@@ -4,7 +4,7 @@ from pathlib import Path
 
 from chonkie.chunker import CodeChunker
 
-from semble.sources import language_for_path
+from semble.file_walker import language_for_path
 from semble.types import Chunk
 
 logger = logging.getLogger(__name__)
@@ -95,5 +95,4 @@ def _chunk_with_chonkie(source: str, file_path: str, language: str) -> list[Chun
 
 
 def _content_hash(content: str) -> str:
-    """Return a short stable hash for chunk content."""
     return hashlib.sha256(content.encode()).hexdigest()[:16]

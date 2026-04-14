@@ -7,29 +7,19 @@ import pytest
 from vicinity import Metric, Vicinity
 
 from semble.search import search_bm25, search_hybrid, search_semantic
+from semble.tokens import tokenize
 from semble.types import Chunk, SearchMode
-from semble.utils import tokenize
-
-
-def _make_chunk(content: str, file_path: str = "file.py") -> Chunk:
-    return Chunk(
-        content=content,
-        file_path=file_path,
-        start_line=1,
-        end_line=content.count("\n") + 1,
-        language="python",
-        content_hash=content[:16],  # stable stand-in; tests don't rely on hash correctness
-    )
+from tests.conftest import make_chunk
 
 
 @pytest.fixture
 def chunks() -> list[Chunk]:
     """Four small code chunks covering authentication, login, user service, and utils."""
     return [
-        _make_chunk("def authenticate(token):\n    return token == 'secret'", "auth.py"),
-        _make_chunk("def login(username, password):\n    pass", "auth.py"),
-        _make_chunk("class UserService:\n    pass", "users.py"),
-        _make_chunk("def format_date(dt):\n    return str(dt)", "utils.py"),
+        make_chunk("def authenticate(token):\n    return token == 'secret'", "auth.py"),
+        make_chunk("def login(username, password):\n    pass", "auth.py"),
+        make_chunk("class UserService:\n    pass", "users.py"),
+        make_chunk("def format_date(dt):\n    return str(dt)", "utils.py"),
     ]
 
 
@@ -54,7 +44,7 @@ def bm25(chunks: list[Chunk]) -> bm25s.BM25:
 @pytest.fixture
 def semantic(chunks: list[Chunk], embeddings: npt.NDArray[np.float32]) -> Vicinity:
     """Pre-built ANNS index over the chunks fixture."""
-    return Vicinity.from_vectors_and_items(embeddings, chunks, metric=Metric.COSINE)
+    return Vicinity.from_vectors_and_items(embeddings, chunks, metric=Metric.COSINE, store_vectors=True)
 
 
 def test_bm25_search(bm25: bm25s.BM25, chunks: list[Chunk]) -> None:
@@ -86,15 +76,15 @@ def test_hybrid_returns_results(chunks: list[Chunk], semantic: Vicinity, bm25: b
 def test_hybrid_keeps_both_locations_for_identical_content(mock_model: Any) -> None:
     """Identical chunk content in different files produces two distinct results."""
     shared_content = "def helper():\n    pass"
-    chunk_a = _make_chunk(shared_content, "module_a.py")
-    chunk_b = _make_chunk(shared_content, "module_b.py")
+    chunk_a = make_chunk(shared_content, "module_a.py")
+    chunk_b = make_chunk(shared_content, "module_b.py")
     all_chunks = [chunk_a, chunk_b]
 
     rng = np.random.default_rng(1)
     embs = rng.standard_normal((2, 256)).astype(np.float32)
     embs /= np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
 
-    sem_index = Vicinity.from_vectors_and_items(embs, all_chunks, metric=Metric.COSINE)
+    sem_index = Vicinity.from_vectors_and_items(embs, all_chunks, metric=Metric.COSINE, store_vectors=True)
     bm25_index = bm25s.BM25()
     bm25_index.index([tokenize(c.content) for c in all_chunks], show_progress=False)
 
@@ -105,14 +95,15 @@ def test_hybrid_keeps_both_locations_for_identical_content(mock_model: Any) -> N
 
 
 @pytest.mark.parametrize(
-    ("mode", "query", "top_k"),
+    ("search_fn", "mode", "query", "top_k"),
     [
-        (SearchMode.BM25, "authenticate", 3),
-        (SearchMode.SEMANTIC, "query", 4),
-        (SearchMode.HYBRID, "login", 4),
+        (lambda q, m, s, b, c, k: search_bm25(q, b, c, k), SearchMode.BM25, "authenticate", 3),
+        (lambda q, m, s, b, c, k: search_semantic(q, m, s, k), SearchMode.SEMANTIC, "query", 4),
+        (lambda q, m, s, b, c, k: search_hybrid(q, m, s, b, c, k), SearchMode.HYBRID, "login", 4),
     ],
 )
 def test_search_source_labels(
+    search_fn: Any,
     mode: SearchMode,
     query: str,
     top_k: int,
@@ -122,11 +113,6 @@ def test_search_source_labels(
     mock_model: Any,
 ) -> None:
     """Each result carries a source label matching the search mode used."""
-    if mode is SearchMode.BM25:
-        results = search_bm25(query, bm25, chunks, top_k)
-    elif mode is SearchMode.SEMANTIC:
-        results = search_semantic(query, mock_model, semantic, top_k)
-    else:
-        results = search_hybrid(query, mock_model, semantic, bm25, chunks, top_k)
+    results = search_fn(query, mock_model, semantic, bm25, chunks, top_k)
     assert len(results) > 0
     assert all(result.source is mode for result in results)
