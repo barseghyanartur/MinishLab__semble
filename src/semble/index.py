@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
-import os
 import subprocess
 import tempfile
 from pathlib import Path
 
 import bm25s
 import numpy as np
+import numpy.typing as npt
 from huggingface_hub import utils as hf_utils
 from model2vec import StaticModel
 from vicinity import Metric, Vicinity
@@ -17,52 +16,9 @@ from semble.chunker import chunk_source
 from semble.file_walker import language_for_path, resolve_extensions, walk_files
 from semble.search import search_bm25, search_hybrid, search_semantic
 from semble.tokens import tokenize
-from semble.types import Chunk, EmbeddingMatrix, Encoder, IndexStats, SearchMode, SearchResult
+from semble.types import Chunk, Encoder, IndexStats, SearchMode, SearchResult
 
 DEFAULT_MODEL_NAME = "minishlab/potion-code-16M"
-
-
-class _EmbeddingCache:
-    """Embedding cache combining an in-memory dict with optional disk storage."""
-
-    def __init__(
-        self,
-        memory: dict[str, EmbeddingMatrix],
-        cache_dir: Path | None,
-        cache_namespace: str | None,
-    ) -> None:
-        self._memory = memory
-        safe = cache_namespace.replace("/", "--").replace("..", "__") if cache_namespace else None
-        self._root = cache_dir / safe if cache_dir and safe else None
-
-    def get(self, key: str) -> EmbeddingMatrix | None:
-        """Return the embedding for key, promoting a disk hit to memory. None on miss."""
-        if key in self._memory:
-            return self._memory[key]
-        if self._root is None:
-            return None
-        try:
-            embedding = np.load(self._root / key[:2] / f"{key}.npy", allow_pickle=False)
-        except (FileNotFoundError, ValueError, OSError):
-            return None
-        self._memory[key] = embedding
-        return embedding
-
-    def put(self, key: str, embedding: EmbeddingMatrix) -> None:
-        """Store embedding in memory and atomically write to disk if caching is enabled."""
-        self._memory[key] = embedding
-        if self._root is None:
-            return
-        path = self._root / key[:2] / f"{key}.npy"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_descriptor, tmp_file = tempfile.mkstemp(dir=path.parent, suffix=".npy.tmp")
-        try:
-            with os.fdopen(file_descriptor, "wb") as file_handle:
-                np.save(file_handle, embedding, allow_pickle=False)
-            os.replace(tmp_file, path)
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_file)
 
 
 class SembleIndex:
@@ -71,33 +27,14 @@ class SembleIndex:
     def __init__(
         self,
         model: Encoder | None = None,
-        *,
-        enable_caching: bool = True,
-        cache_dir: str | Path | None = None,
-        model_name: str | None = None,
     ) -> None:
-        """Configure the index and caching backend.
+        """Configure the index.
 
         :param model: Embedding model to use. Defaults to potion-code-16M.
-        :param enable_caching: Whether to persist embeddings to disk between runs.
-        :param cache_dir: Override the cache directory. Defaults to ~/.cache/semble.
-        :param model_name: Stable identifier for a custom encoder, used as the disk cache namespace.
         """
         self.model: Encoder | None = model
-        if not enable_caching:
-            self.cache_dir: Path | None = None
-            self.cache_namespace: str | None = None
-        else:
-            root = Path(cache_dir).expanduser() if cache_dir is not None else Path.home() / ".cache" / "semble"
-            if model is None:
-                self.cache_dir, self.cache_namespace = root, DEFAULT_MODEL_NAME
-            elif model_name is not None:
-                self.cache_dir, self.cache_namespace = root, model_name
-            else:
-                self.cache_dir, self.cache_namespace = None, None
         self.chunks: list[Chunk] = []
         self.stats = IndexStats()
-        self._embedding_cache: dict[str, EmbeddingMatrix] = {}
         self._bm25_index: bm25s.BM25 | None = None
         self._semantic_index: Vicinity | None = None
         self._index_root: Path | None = None
@@ -110,9 +47,6 @@ class SembleIndex:
         extensions: frozenset[str] | None = None,
         ignore: frozenset[str] | None = None,
         include_docs: bool = False,
-        enable_caching: bool = True,
-        cache_dir: str | Path | None = None,
-        model_name: str | None = None,
     ) -> SembleIndex:
         """Create and index a SembleIndex from a directory.
 
@@ -121,12 +55,9 @@ class SembleIndex:
         :param extensions: File extensions to include. Defaults to a standard set of code extensions.
         :param ignore: Directory names to skip. Defaults to common VCS and build dirs.
         :param include_docs: If True, also index documentation files (.md, .yaml, etc.).
-        :param enable_caching: Whether to persist embeddings to disk between runs.
-        :param cache_dir: Override the cache directory. Defaults to ~/.cache/semble.
-        :param model_name: Stable identifier for a custom encoder, used as the disk cache namespace.
         :return: An indexed SembleIndex.
         """
-        instance = cls(model=model, enable_caching=enable_caching, cache_dir=cache_dir, model_name=model_name)
+        instance = cls(model=model)
         instance.index(path, extensions=extensions, ignore=ignore, include_docs=include_docs)
         return instance
 
@@ -139,9 +70,6 @@ class SembleIndex:
         extensions: frozenset[str] | None = None,
         ignore: frozenset[str] | None = None,
         include_docs: bool = False,
-        enable_caching: bool = True,
-        cache_dir: str | Path | None = None,
-        model_name: str | None = None,
     ) -> SembleIndex:
         """Clone a git repository and index it.
 
@@ -151,9 +79,6 @@ class SembleIndex:
         :param extensions: File extensions to include. Defaults to a standard set of code extensions.
         :param ignore: Directory names to skip. Defaults to common VCS and build dirs.
         :param include_docs: If True, also index documentation files (.md, .yaml, etc.).
-        :param enable_caching: Whether to persist embeddings to disk between runs.
-        :param cache_dir: Override the cache directory. Defaults to ~/.cache/semble.
-        :param model_name: Stable identifier for a custom encoder, used as the disk cache namespace.
         :return: An indexed SembleIndex. Chunk file paths are repo-relative (e.g. ``src/foo.py``).
         :raises RuntimeError: If git is not on PATH or the clone fails.
         """
@@ -165,18 +90,14 @@ class SembleIndex:
                 raise RuntimeError("git is not installed or not on PATH") from None
             if result.returncode != 0:
                 raise RuntimeError(f"git clone failed for {url!r}:\n{result.stderr.strip()}")
-            instance = cls.from_path(
-                tmp_dir,
-                model=model,
+            instance = cls(model=model)
+            instance._index_path(
+                Path(tmp_dir).resolve(),
                 extensions=extensions,
                 ignore=ignore,
                 include_docs=include_docs,
-                enable_caching=enable_caching,
-                cache_dir=cache_dir,
-                model_name=model_name,
+                display_root=Path(tmp_dir).resolve(),
             )
-            # Remap to relative paths and resolve to handle OS-level symlinks.
-            instance._remap_to_relative(Path(tmp_dir).resolve())
             return instance
 
     def index(
@@ -194,8 +115,26 @@ class SembleIndex:
         :param include_docs: If True, also index documentation files.
         :return: Statistics about the indexed files and chunks.
         """
-        path = Path(path).resolve()
-        self._index_root = path
+        return self._index_path(Path(path).resolve(), extensions=extensions, ignore=ignore, include_docs=include_docs)
+
+    def _index_path(
+        self,
+        path: Path,
+        extensions: frozenset[str] | None = None,
+        ignore: frozenset[str] | None = None,
+        include_docs: bool = False,
+        display_root: Path | None = None,
+    ) -> IndexStats:
+        """Index a resolved directory, optionally storing chunk paths relative to display_root.
+
+        :param path: Resolved absolute path to index.
+        :param extensions: File extensions to include.
+        :param ignore: Directory names to skip.
+        :param include_docs: If True, also index documentation files.
+        :param display_root: If set, chunk file paths are stored relative to this root.
+        :return: Statistics about the indexed files and chunks.
+        """
+        self._index_root = None if display_root is not None else path
         extensions = resolve_extensions(extensions, include_docs=include_docs)
 
         all_chunks: list[Chunk] = []
@@ -207,7 +146,8 @@ class SembleIndex:
             with contextlib.suppress(OSError):
                 source = file_path.read_text(encoding="utf-8", errors="replace")
                 indexed_files += 1
-                file_chunks = chunk_source(source, str(file_path), language)
+                chunk_path = str(file_path.relative_to(display_root)) if display_root else str(file_path)
+                file_chunks = chunk_source(source, chunk_path, language)
                 all_chunks.extend(file_chunks)
                 for chunk in file_chunks:
                     if chunk.language:
@@ -299,44 +239,12 @@ class SembleIndex:
                 hf_utils.enable_progress_bars()
         return self.model
 
-    def _embed_chunks(self, chunks: list[Chunk]) -> EmbeddingMatrix:
-        """Embed chunks, consulting memory then disk before calling the model."""
+    def _embed_chunks(self, chunks: list[Chunk]) -> npt.NDArray[np.float32]:
+        """Embed chunks using the configured model."""
         if not chunks:
             return np.empty((0, 256), dtype=np.float32)
-
-        cache = _EmbeddingCache(self._embedding_cache, self.cache_dir, self.cache_namespace)
-
-        miss_indices: list[int] = []
-        miss_texts: list[str] = []
-
-        for i, chunk in enumerate(chunks):
-            if cache.get(chunk.content_hash) is None:
-                miss_indices.append(i)
-                miss_texts.append(chunk.content)
-
-        if miss_indices:
-            model = self._ensure_model()
-            for i, embedding in zip(miss_indices, model.encode(miss_texts), strict=True):
-                cache.put(chunks[i].content_hash, embedding)
-
-        return np.array([self._embedding_cache[chunk.content_hash] for chunk in chunks], dtype=np.float32)
-
-    def _remap_to_relative(self, tmp_root: Path) -> None:
-        """Rewrite chunk file_paths from absolute temp-dir paths to repo-relative paths.
-
-        :param tmp_root: Resolved absolute path to the cloned repo root.
-        """
-        remapped = [
-            dataclasses.replace(chunk, file_path=str(Path(chunk.file_path).relative_to(tmp_root)))
-            for chunk in self.chunks
-        ]
-        self.chunks = remapped
-        # No meaningful local root once paths are repo-relative.
-        self._index_root = None
-        if self._semantic_index is not None:
-            # file_path only changed: read from cache.
-            embeddings = np.array([self._embedding_cache[c.content_hash] for c in remapped], dtype=np.float32)
-            self._semantic_index = Vicinity.from_vectors_and_items(embeddings, remapped, metric=Metric.COSINE)
+        model = self._ensure_model()
+        return np.array(model.encode([c.content for c in chunks]), dtype=np.float32)
 
     def _enrich_for_bm25(self, chunk: Chunk, root: Path | None) -> str:
         """Append file path components to BM25 content to boost path-based queries.
