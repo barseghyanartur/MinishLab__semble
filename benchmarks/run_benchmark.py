@@ -4,7 +4,8 @@ import math
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -49,6 +50,7 @@ class RepoResult:
     p95_ms: float
     p99_ms: float
     index_ms: float
+    by_category: dict[str, float] = field(default_factory=dict)
 
 
 def _dcg(relevances: list[int]) -> float:
@@ -68,11 +70,14 @@ def _ndcg_at_k(relevant_ranks: list[int], n_relevant: int, k: int) -> float:
     return _dcg(relevances) / ideal if ideal > 0 else 0.0
 
 
-def _evaluate(index: SembleIndex, tasks: list[Task], *, verbose: bool = False) -> tuple[float, float, list[float]]:
-    """Return mean NDCG@5, NDCG@10, and median query latency (ms) across all tasks."""
+def _evaluate(
+    index: SembleIndex, tasks: list[Task], *, verbose: bool = False
+) -> tuple[float, float, list[float], dict[str, float]]:
+    """Return mean NDCG@5, NDCG@10, median query latency (ms), and per-category NDCG@10."""
     ndcg5_sum = 0.0
     ndcg10_sum = 0.0
     latencies: list[float] = []
+    cat_ndcg10: dict[str, list[float]] = defaultdict(list)
 
     for task in tasks:
         query_latencies: list[float] = []
@@ -82,18 +87,17 @@ def _evaluate(index: SembleIndex, tasks: list[Task], *, verbose: bool = False) -
             started = time.perf_counter()
             results = index.search(task.query, top_k=_DIRECT_TOP_K)
             query_latencies.append((time.perf_counter() - started) * 1000)
-        latencies.append(np.median(query_latencies))
+        latencies.append(float(np.median(query_latencies)))
 
         relevant_ranks = [rank for target in task.all_relevant if (rank := _target_rank(results, target)) is not None]
-        n_relevant = sum(
-            1
-            for target in task.all_relevant
-            if any(target_matches_location(c.file_path, c.start_line, c.end_line, target) for c in index.chunks)
-        )
+        # Use annotation count as ideal, not index coverage. If the indexer drops a
+        # target file, ideal DCG should not shrink and make NDCG look artificially good.
+        n_relevant = len(task.all_relevant)
         q_ndcg5 = _ndcg_at_k(relevant_ranks, n_relevant, 5)
         q_ndcg10 = _ndcg_at_k(relevant_ranks, n_relevant, 10)
         ndcg5_sum += q_ndcg5
         ndcg10_sum += q_ndcg10
+        cat_ndcg10[task.category or "unknown"].append(q_ndcg10)
 
         if verbose:
             cat = task.category or "?"
@@ -109,7 +113,8 @@ def _evaluate(index: SembleIndex, tasks: list[Task], *, verbose: bool = False) -
             print(f"               top-5:   {top_files}", file=sys.stderr)
 
     total = len(tasks)
-    return ndcg5_sum / total, ndcg10_sum / total, latencies
+    by_category = {cat: sum(vals) / len(vals) for cat, vals in sorted(cat_ndcg10.items())}
+    return ndcg5_sum / total, ndcg10_sum / total, latencies, by_category
 
 
 def _print_summary(results: list[RepoResult]) -> None:
@@ -118,12 +123,19 @@ def _print_summary(results: list[RepoResult]) -> None:
     by_language = {lang: [r for r in results if r.language == lang] for lang in languages}
     columns = ["Avg", *[lang.title() for lang in languages]]
 
-    avg_ndcg10 = sum(r.ndcg10 for r in results) / len(results)
-    avg_p50 = sum(r.p50_ms for r in results) / len(results)
-    avg_p90 = sum(r.p90_ms for r in results) / len(results)
-    avg_p95 = sum(r.p95_ms for r in results) / len(results)
-    avg_p99 = sum(r.p99_ms for r in results) / len(results)
-    avg_index = sum(r.index_ms for r in results) / len(results)
+    # Headline: mean of per-language means (one vote per language, not per repo).
+    lang_ndcg10 = [sum(r.ndcg10 for r in g) / len(g) for g in by_language.values()]
+    lang_p50 = [sum(r.p50_ms for r in g) / len(g) for g in by_language.values()]
+    lang_p90 = [sum(r.p90_ms for r in g) / len(g) for g in by_language.values()]
+    lang_p95 = [sum(r.p95_ms for r in g) / len(g) for g in by_language.values()]
+    lang_p99 = [sum(r.p99_ms for r in g) / len(g) for g in by_language.values()]
+    lang_index = [sum(r.index_ms for r in g) / len(g) for g in by_language.values()]
+    avg_ndcg10 = sum(lang_ndcg10) / len(lang_ndcg10)
+    avg_p50 = sum(lang_p50) / len(lang_p50)
+    avg_p90 = sum(lang_p90) / len(lang_p90)
+    avg_p95 = sum(lang_p95) / len(lang_p95)
+    avg_p99 = sum(lang_p99) / len(lang_p99)
+    avg_index = sum(lang_index) / len(lang_index)
 
     print(file=sys.stderr)
     print("By language", file=sys.stderr)
@@ -168,6 +180,16 @@ def _print_summary(results: list[RepoResult]) -> None:
     print(f"  {'q-p99':<28}  " + "  ".join(p99_row), file=sys.stderr)
     print(f"  {'index':<28}  " + "  ".join(index_row), file=sys.stderr)
 
+    # Per-category NDCG@10 summary (flat mean across all repos).
+    all_categories = sorted({cat for r in results for cat in r.by_category})
+    if all_categories:
+        print(file=sys.stderr)
+        print("By category (NDCG@10, mean over all repos)", file=sys.stderr)
+        for cat in all_categories:
+            vals = [r.by_category[cat] for r in results if cat in r.by_category]
+            mean_val = sum(vals) / len(vals) if vals else 0.0
+            print(f"  {cat:<16}  {mean_val:.3f}  (n={len(vals)} repos)", file=sys.stderr)
+
 
 def _bench_quality(
     repo_tasks: dict[str, list[Task]], model: StaticModel, specs: dict[str, RepoSpec], *, verbose: bool = False
@@ -188,7 +210,7 @@ def _bench_quality(
         started = time.perf_counter()
         index = SembleIndex.from_path(spec.benchmark_dir, model=model)
         index_ms = (time.perf_counter() - started) * 1000
-        ndcg5, ndcg10, latencies = _evaluate(index, tasks, verbose=verbose)
+        ndcg5, ndcg10, latencies, by_category = _evaluate(index, tasks, verbose=verbose)
         p50, p90, p95, p99 = np.percentile(latencies, [50, 90, 95, 99]).tolist()
         result = RepoResult(
             repo=repo,
@@ -201,6 +223,7 @@ def _bench_quality(
             p95_ms=p95,
             p99_ms=p99,
             index_ms=index_ms,
+            by_category=by_category,
         )
         results.append(result)
         print(
@@ -221,28 +244,52 @@ def _save_results(results: list[RepoResult]) -> None:
     languages = sorted({r.language for r in results})
     by_language = {lang: [r for r in results if r.language == lang] for lang in languages}
 
+    # Headline: mean of per-language means (one vote per language, not per repo).
+    lang_means = {
+        lang: {
+            "ndcg10": sum(r.ndcg10 for r in grouped) / len(grouped),
+            "p50_ms": sum(r.p50_ms for r in grouped) / len(grouped),
+            "p90_ms": sum(r.p90_ms for r in grouped) / len(grouped),
+            "p95_ms": sum(r.p95_ms for r in grouped) / len(grouped),
+            "p99_ms": sum(r.p99_ms for r in grouped) / len(grouped),
+            "index_ms": sum(r.index_ms for r in grouped) / len(grouped),
+        }
+        for lang, grouped in by_language.items()
+    }
+    n_langs = len(lang_means)
+
+    # Aggregate per-category NDCG@10 across all repos (flat mean over all tasks).
+    all_categories: set[str] = set()
+    for r in results:
+        all_categories.update(r.by_category)
+    cat_means: dict[str, float] = {}
+    for cat in sorted(all_categories):
+        vals = [r.by_category[cat] for r in results if cat in r.by_category]
+        cat_means[cat] = round(sum(vals) / len(vals), 4) if vals else 0.0
+
     output = {
         "sha": sha,
         "model": _DEFAULT_MODEL_NAME,
         "summary": {
-            "ndcg10": round(sum(r.ndcg10 for r in results) / len(results), 4),
-            "p50_ms": round(sum(r.p50_ms for r in results) / len(results), 3),
-            "p90_ms": round(sum(r.p90_ms for r in results) / len(results), 3),
-            "p95_ms": round(sum(r.p95_ms for r in results) / len(results), 3),
-            "p99_ms": round(sum(r.p99_ms for r in results) / len(results), 3),
-            "index_ms": round(sum(r.index_ms for r in results) / len(results), 1),
+            "ndcg10": round(sum(v["ndcg10"] for v in lang_means.values()) / n_langs, 4),
+            "p50_ms": round(sum(v["p50_ms"] for v in lang_means.values()) / n_langs, 3),
+            "p90_ms": round(sum(v["p90_ms"] for v in lang_means.values()) / n_langs, 3),
+            "p95_ms": round(sum(v["p95_ms"] for v in lang_means.values()) / n_langs, 3),
+            "p99_ms": round(sum(v["p99_ms"] for v in lang_means.values()) / n_langs, 3),
+            "index_ms": round(sum(v["index_ms"] for v in lang_means.values()) / n_langs, 1),
+            "by_category": cat_means,
         },
         "by_language": {
             lang: {
-                "repos": len(grouped),
-                "ndcg10": round(sum(r.ndcg10 for r in grouped) / len(grouped), 4),
-                "p50_ms": round(sum(r.p50_ms for r in grouped) / len(grouped), 3),
-                "p90_ms": round(sum(r.p90_ms for r in grouped) / len(grouped), 3),
-                "p95_ms": round(sum(r.p95_ms for r in grouped) / len(grouped), 3),
-                "p99_ms": round(sum(r.p99_ms for r in grouped) / len(grouped), 3),
-                "index_ms": round(sum(r.index_ms for r in grouped) / len(grouped), 1),
+                "repos": len(by_language[lang]),
+                "ndcg10": round(v["ndcg10"], 4),
+                "p50_ms": round(v["p50_ms"], 3),
+                "p90_ms": round(v["p90_ms"], 3),
+                "p95_ms": round(v["p95_ms"], 3),
+                "p99_ms": round(v["p99_ms"], 3),
+                "index_ms": round(v["index_ms"], 1),
             }
-            for lang, grouped in by_language.items()
+            for lang, v in lang_means.items()
         },
         "repos": [asdict(r) for r in results],
     }
