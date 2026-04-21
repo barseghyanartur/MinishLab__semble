@@ -1,26 +1,23 @@
 import argparse
 import json
-import math
-import subprocess
 import sys
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import cast
 
 import numpy as np
 from model2vec import StaticModel
 
 from benchmarks.data import (
     RepoSpec,
-    Target,
     Task,
     apply_task_filters,
     available_repo_specs,
+    grouped_tasks,
     load_tasks,
-    target_matches_location,
+    save_results,
 )
+from benchmarks.metrics import ndcg_at_k, target_rank
 from semble import SembleIndex
 from semble.index.dense import _DEFAULT_MODEL_NAME
 from semble.types import SearchResult
@@ -29,17 +26,10 @@ _LATENCY_RUNS = 5
 _DIRECT_TOP_K = 10
 
 
-def _target_rank(results: list[SearchResult], target: Target) -> int | None:
-    """Return the 1-based rank of the first result covering target, or None."""
-    for index, result in enumerate(results, 1):
-        chunk = result.chunk
-        if target_matches_location(chunk.file_path, chunk.start_line, chunk.end_line, target):
-            return index
-    return None
-
-
 @dataclass(frozen=True)
 class RepoResult:
+    """Per-repo benchmark result."""
+
     repo: str
     language: str
     chunks: int
@@ -53,23 +43,6 @@ class RepoResult:
     by_category: dict[str, float] = field(default_factory=dict)
 
 
-def _dcg(relevances: list[int]) -> float:
-    """Compute Discounted Cumulative Gain for a ranked relevance list."""
-    return sum(rel / math.log2(i + 2) for i, rel in enumerate(relevances))
-
-
-def _ndcg_at_k(relevant_ranks: list[int], n_relevant: int, k: int) -> float:
-    """Compute NDCG@k given the ranks of relevant results and the total relevant count."""
-    if n_relevant == 0:
-        return 0.0
-    relevances = [0] * k
-    for rank in relevant_ranks:
-        if 1 <= rank <= k:
-            relevances[rank - 1] = 1
-    ideal = _dcg([1] * min(k, n_relevant))
-    return _dcg(relevances) / ideal if ideal > 0 else 0.0
-
-
 def _evaluate(
     index: SembleIndex, tasks: list[Task], *, verbose: bool = False
 ) -> tuple[float, float, list[float], dict[str, float]]:
@@ -77,43 +50,41 @@ def _evaluate(
     ndcg5_sum = 0.0
     ndcg10_sum = 0.0
     latencies: list[float] = []
-    cat_ndcg10: dict[str, list[float]] = defaultdict(list)
+    category_ndcg10: dict[str, list[float]] = defaultdict(list)
 
     for task in tasks:
         query_latencies: list[float] = []
-        # Bind results
-        results = []
+        results: list[SearchResult]
         for _ in range(_LATENCY_RUNS):
             started = time.perf_counter()
             results = index.search(task.query, top_k=_DIRECT_TOP_K)
             query_latencies.append((time.perf_counter() - started) * 1000)
         latencies.append(float(np.median(query_latencies)))
 
-        relevant_ranks = [rank for target in task.all_relevant if (rank := _target_rank(results, target)) is not None]
-        # Use annotation count as ideal, not index coverage. If the indexer drops a
-        # target file, ideal DCG should not shrink and make NDCG look artificially good.
+        relevant_ranks = [rank for t in task.all_relevant if (rank := target_rank(results, t)) is not None]
         n_relevant = len(task.all_relevant)
-        q_ndcg5 = _ndcg_at_k(relevant_ranks, n_relevant, 5)
-        q_ndcg10 = _ndcg_at_k(relevant_ranks, n_relevant, 10)
+        q_ndcg5 = ndcg_at_k(relevant_ranks, n_relevant, 5)
+        q_ndcg10 = ndcg_at_k(relevant_ranks, n_relevant, _DIRECT_TOP_K)
         ndcg5_sum += q_ndcg5
         ndcg10_sum += q_ndcg10
-        cat_ndcg10[task.category or "unknown"].append(q_ndcg10)
+        category_ndcg10[task.category or "unknown"].append(q_ndcg10)
 
         if verbose:
-            cat = task.category or "?"
+            category = task.category or "?"
             targets_str = ", ".join(
                 t.path if not t.start_line else f"{t.path}:{t.start_line}-{t.end_line}" for t in task.all_relevant
             )
             top_files = [r.chunk.file_path for r in results[:5]]
             print(
-                f"  [{cat:<12}] ndcg@10={q_ndcg10:.3f}  ranks={relevant_ranks}  n_rel={n_relevant}  q={task.query!r}",
+                f"  [{category:<12}] ndcg@10={q_ndcg10:.3f}  ranks={relevant_ranks}"
+                f"  n_rel={n_relevant}  q={task.query!r}",
                 file=sys.stderr,
             )
             print(f"               targets: {targets_str}", file=sys.stderr)
             print(f"               top-5:   {top_files}", file=sys.stderr)
 
     total = len(tasks)
-    by_category = {cat: sum(vals) / len(vals) for cat, vals in sorted(cat_ndcg10.items())}
+    by_category = {cat: sum(vals) / len(vals) for cat, vals in sorted(category_ndcg10.items())}
     return ndcg5_sum / total, ndcg10_sum / total, latencies, by_category
 
 
@@ -123,19 +94,30 @@ def _print_summary(results: list[RepoResult]) -> None:
     by_language = {lang: [r for r in results if r.language == lang] for lang in languages}
     columns = ["Avg", *[lang.title() for lang in languages]]
 
-    # Headline: mean of per-language means (one vote per language, not per repo).
-    lang_ndcg10 = [sum(r.ndcg10 for r in g) / len(g) for g in by_language.values()]
-    lang_p50 = [sum(r.p50_ms for r in g) / len(g) for g in by_language.values()]
-    lang_p90 = [sum(r.p90_ms for r in g) / len(g) for g in by_language.values()]
-    lang_p95 = [sum(r.p95_ms for r in g) / len(g) for g in by_language.values()]
-    lang_p99 = [sum(r.p99_ms for r in g) / len(g) for g in by_language.values()]
-    lang_index = [sum(r.index_ms for r in g) / len(g) for g in by_language.values()]
-    avg_ndcg10 = sum(lang_ndcg10) / len(lang_ndcg10)
-    avg_p50 = sum(lang_p50) / len(lang_p50)
-    avg_p90 = sum(lang_p90) / len(lang_p90)
-    avg_p95 = sum(lang_p95) / len(lang_p95)
-    avg_p99 = sum(lang_p99) / len(lang_p99)
-    avg_index = sum(lang_index) / len(lang_index)
+    language_ndcg10 = [
+        sum(r.ndcg10 for r in language_results) / len(language_results) for language_results in by_language.values()
+    ]
+    language_p50 = [
+        sum(r.p50_ms for r in language_results) / len(language_results) for language_results in by_language.values()
+    ]
+    language_p90 = [
+        sum(r.p90_ms for r in language_results) / len(language_results) for language_results in by_language.values()
+    ]
+    language_p95 = [
+        sum(r.p95_ms for r in language_results) / len(language_results) for language_results in by_language.values()
+    ]
+    language_p99 = [
+        sum(r.p99_ms for r in language_results) / len(language_results) for language_results in by_language.values()
+    ]
+    language_index = [
+        sum(r.index_ms for r in language_results) / len(language_results) for language_results in by_language.values()
+    ]
+    avg_ndcg10 = sum(language_ndcg10) / len(language_ndcg10)
+    avg_p50 = sum(language_p50) / len(language_p50)
+    avg_p90 = sum(language_p90) / len(language_p90)
+    avg_p95 = sum(language_p95) / len(language_p95)
+    avg_p99 = sum(language_p99) / len(language_p99)
+    avg_index = sum(language_index) / len(language_index)
 
     print(file=sys.stderr)
     print("By language", file=sys.stderr)
@@ -180,7 +162,6 @@ def _print_summary(results: list[RepoResult]) -> None:
     print(f"  {'q-p99':<28}  " + "  ".join(p99_row), file=sys.stderr)
     print(f"  {'index':<28}  " + "  ".join(index_row), file=sys.stderr)
 
-    # Per-category NDCG@10 summary (flat mean across all repos).
     all_categories = sorted({cat for r in results for cat in r.by_category})
     if all_categories:
         print(file=sys.stderr)
@@ -196,7 +177,7 @@ def _bench_quality(
 ) -> list[RepoResult]:
     """Run quality benchmarks (NDCG@5, NDCG@10, latency) for each repo."""
     print(
-        f"{'Repo':<12} {'language':<12} {'chunks':>6} {'index':>9} {'NDCG@5':>8} {'NDCG@10':>8} {'p50':>8} {'p90':>8}"
+        f"{'Repo':<12} {'Language':<12} {'Chunks':>6} {'index':>9} {'NDCG@5':>8} {'NDCG@10':>8} {'p50':>8} {'p90':>8}"
         f" {'p95':>8} {'p99':>8}",
         file=sys.stderr,
     )
@@ -235,16 +216,10 @@ def _bench_quality(
 
 
 def _save_results(results: list[RepoResult]) -> None:
-    """Write results to benchmarks/results/<sha>.json."""
-    try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    except subprocess.CalledProcessError:
-        sha = "unknown"
-
+    """Write results to benchmarks/results/semble-hybrid-<sha12>.json."""
     languages = sorted({r.language for r in results})
     by_language = {lang: [r for r in results if r.language == lang] for lang in languages}
 
-    # Headline: mean of per-language means (one vote per language, not per repo).
     lang_means = {
         lang: {
             "ndcg10": sum(r.ndcg10 for r in grouped) / len(grouped),
@@ -256,9 +231,6 @@ def _save_results(results: list[RepoResult]) -> None:
         }
         for lang, grouped in by_language.items()
     }
-    n_langs = len(lang_means)
-
-    # Aggregate per-category NDCG@10 across all repos (flat mean over all tasks).
     all_categories: set[str] = set()
     for r in results:
         all_categories.update(r.by_category)
@@ -267,16 +239,17 @@ def _save_results(results: list[RepoResult]) -> None:
         vals = [r.by_category[cat] for r in results if cat in r.by_category]
         cat_means[cat] = round(sum(vals) / len(vals), 4) if vals else 0.0
 
+    n_repos = len(results)
     output = {
-        "sha": sha,
+        "tool": "semble-hybrid",
         "model": _DEFAULT_MODEL_NAME,
         "summary": {
-            "ndcg10": round(sum(v["ndcg10"] for v in lang_means.values()) / n_langs, 4),
-            "p50_ms": round(sum(v["p50_ms"] for v in lang_means.values()) / n_langs, 3),
-            "p90_ms": round(sum(v["p90_ms"] for v in lang_means.values()) / n_langs, 3),
-            "p95_ms": round(sum(v["p95_ms"] for v in lang_means.values()) / n_langs, 3),
-            "p99_ms": round(sum(v["p99_ms"] for v in lang_means.values()) / n_langs, 3),
-            "index_ms": round(sum(v["index_ms"] for v in lang_means.values()) / n_langs, 1),
+            "ndcg10": round(sum(r.ndcg10 for r in results) / n_repos, 4),
+            "p50_ms": round(sum(r.p50_ms for r in results) / n_repos, 3),
+            "p90_ms": round(sum(r.p90_ms for r in results) / n_repos, 3),
+            "p95_ms": round(sum(r.p95_ms for r in results) / n_repos, 3),
+            "p99_ms": round(sum(r.p99_ms for r in results) / n_repos, 3),
+            "index_ms": round(sum(r.index_ms for r in results) / n_repos, 1),
             "by_category": cat_means,
         },
         "by_language": {
@@ -294,15 +267,12 @@ def _save_results(results: list[RepoResult]) -> None:
         "repos": [asdict(r) for r in results],
     }
 
-    results_dir = Path(__file__).parent / "results"
-    results_dir.mkdir(exist_ok=True)
-    out_path = results_dir / f"{sha[:12]}.json"
-    out_path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    out_path = save_results("semble-hybrid", output)
     print(f"\nResults saved to {out_path}", file=sys.stderr)
 
 
 def main() -> None:
-    """Parse arguments and run the selected benchmark mode."""
+    """Parse arguments and run the semble hybrid benchmark."""
     parser = argparse.ArgumentParser(description="Benchmark hybrid semble search across the pinned benchmark repos.")
     parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
     parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
@@ -319,9 +289,7 @@ def main() -> None:
     model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)
     print(f"Loaded in {(time.perf_counter() - started) * 1000:.0f} ms", file=sys.stderr)
     print(file=sys.stderr)
-    repo_tasks: dict[str, list[Task]] = {}
-    for task in tasks:
-        repo_tasks.setdefault(task.repo, []).append(task)
+    repo_tasks = grouped_tasks(tasks)
     results = _bench_quality(repo_tasks, model, repo_specs, verbose=args.verbose)
     _print_summary(results)
     if not args.repo and not args.language:

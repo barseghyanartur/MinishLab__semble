@@ -297,11 +297,11 @@
     "benchmark_root": "Sources/Vapor"
   },
   {
-    "name": "rxswift",
+    "name": "snapkit",
     "language": "swift",
-    "url": "https://github.com/ReactiveX/RxSwift.git",
-    "revision": "132aea4f236ccadc51590b38af0357a331d51fa2",
-    "benchmark_root": "Sources/RxSwift"
+    "url": "https://github.com/SnapKit/SnapKit.git",
+    "revision": "19f59a63f0faac287f4e59986959859d81ec851c",
+    "benchmark_root": "Sources"
   },
   {
     "name": "plug",
@@ -367,13 +367,6 @@
     "benchmark_root": "src/Data/Aeson"
   },
   {
-    "name": "http-dart",
-    "language": "dart",
-    "url": "https://github.com/dart-lang/http.git",
-    "revision": "fa2d2c21cf6f8d9e72bb962d2cd5f613a7102a71",
-    "benchmark_root": "pkgs/http/lib"
-  },
-  {
     "name": "telescope.nvim",
     "language": "lua",
     "url": "https://github.com/nvim-telescope/telescope.nvim.git",
@@ -421,20 +414,6 @@
     "url": "https://github.com/xmonad/xmonad.git",
     "revision": "59107a6c6f30d82d74449795a5c9149503f176ac",
     "benchmark_root": "src/XMonad"
-  },
-  {
-    "name": "dio",
-    "language": "dart",
-    "url": "https://github.com/cfug/dio.git",
-    "revision": "85aa6f1216203b1ca707289e82e35bcff5070b54",
-    "benchmark_root": "dio/lib/src"
-  },
-  {
-    "name": "riverpod",
-    "language": "dart",
-    "url": "https://github.com/rrousselGit/riverpod.git",
-    "revision": "cac77b1ec1c4b4c0ca7c6e9b1436f80250b4edc0",
-    "benchmark_root": "packages/riverpod/lib/src"
   },
   {
     "name": "mini.nvim",
