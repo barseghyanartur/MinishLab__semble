@@ -164,10 +164,10 @@ If you use Semble in your research, please cite the following:
 ```bibtex
 @software{minishlab2026semble,
   author       = {{van Dongen}, Thomas and Stephan Tulkens},
-  title        = {Semble: Fast Code Search for Agents},
+  title        = {Semble: Fast and Accurate Code Search for Agents},
   year         = {2026},
   publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.XXXXXXX},
+  doi          = {10.5281/zenodo.19785932},
   url          = {https://github.com/MinishLab/semble},
   license      = {MIT}
 }
